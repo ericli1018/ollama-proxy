@@ -32,6 +32,21 @@ const CONTEXT_WINDOW    = parseInt(process.env.OLLAMA_PROXY_CONTEXT_WINDOW || St
 // 動態 token 校正因子（僅用於 /api/chat 路徑）
 let tokenCorrectionFactor = 1.0;
 
+// ── Logging ──────────────────────────────────────────────────────────────────
+function ts() {
+  return new Date().toISOString();
+}
+
+function log(connId, ...args) {
+  const prefix = connId ? `[${ts()}][${connId}]` : `[${ts()}]`;
+  console.log(prefix, ...args);
+}
+
+function newConnId() {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
@@ -57,12 +72,9 @@ function resolveThink(body, betaHeaders = "") {
   const t = body.thinking;
   if (!t) return false;
 
-  // 支援 Anthropic API 的 thinking type: enabled
   if (t.type === "enabled") return (t.budget_tokens ?? 0) > 0;
 
   if (t.type === "adaptive") {
-    // 若請求頭包含 adaptive-thinking-2026-01-28，且為 adaptive 模式，可根據關鍵字或一律啟用
-    // 此處保留原關鍵字邏輯，並可從 beta 頭判斷輔助
     const lastUser = [...(body.messages ?? [])].reverse().find(m => m.role === "user");
     const text = typeof lastUser?.content === "string"
       ? lastUser.content
@@ -76,7 +88,6 @@ function resolveThink(body, betaHeaders = "") {
 
     const ALL_KEYWORDS = [...EN_THINK, ...ZH_TW_THINK, ...ZH_CN_THINK, ...JA_THINK];
     const matched = ALL_KEYWORDS.find(kw => lower.includes(kw));
-    //if (matched) console.log(`[KEYWORD] matched="${matched}"`);
     return !!matched;
   }
   return false;
@@ -104,16 +115,19 @@ function estimateTokens(val) {
 }
 
 // ── think=true (直接轉發 /v1/messages) ──────────────────────────────────────
-function passthroughThink(body, res) {
+function passthroughThink(body, res, connId, estimatedTokens) {
   const model = resolveModel(body.model, true);
   const numCtx = getNumCtx(true);
+  const budgetTokens = body.thinking?.budget_tokens ?? 16000;
   const fixed = {
     ...body,
     model,
-    thinking: { type: "enabled", budget_tokens: body.thinking?.budget_tokens ?? 16000 },
+    thinking: { type: "enabled", budget_tokens: budgetTokens },
     options: { ...(body.options || {}), num_ctx: numCtx }
   };
-  proxyToOllama("/v1/messages", fixed, res, body.stream ?? false);
+
+  log(connId, `→ /v1/messages  ctx=${numCtx}  budget_tokens=${budgetTokens}`);
+  proxyToOllama("/v1/messages", fixed, res, body.stream ?? false, connId, estimatedTokens);
 }
 
 // ── 工具相關函數 ───────────────────────────────────────────────────────────
@@ -194,7 +208,6 @@ function toOllamaTools(tools = []) {
   }));
 }
 
-// fixToolCall 完整保留（略，與原始碼相同）
 const KNOWN_TOOLS = new Set(["Agent","AskUserQuestion","Bash","CronCreate","CronDelete","CronList","Edit","EnterPlanMode","EnterWorktree","ExitPlanMode","ExitWorktree","ListMcpResourcesTool","LSP","NotebookEdit","Read","ReadMcpResourceTool","ScheduleWakeup","Skill","TaskCreate","TaskGet","TaskList","TaskOutput","TaskStop","TaskUpdate","WaitForMcpServers","WebFetch","WebSearch","Write"]);
 const SHELL_RE = /^(find|ls|cat|grep|echo|cd|mkdir|rm|mv|cp|touch|chmod|curl|wget|git|npm|node|python|pip|sed|awk|sort|head|tail|wc|ps|which|stat)\b/;
 
@@ -204,20 +217,17 @@ function fixToolCall(rawName, rawInput) {
   if (!KNOWN_TOOLS.has(clean) && !clean.startsWith("mcp__") && (SHELL_RE.test(clean) || clean.includes(" "))) {
     name  = "Bash";
     input = { command: clean.replace(/<\/parameter[\s\S]*$/, "").trim() };
-    //console.log(`[REPAIR] name→Bash: "${name.slice(0,60)}"`);
   }
   if (typeof input !== "object" || input === null) return { name, input };
   switch (name) {
     case "Bash": {
       const cmd = input.command ?? input.code ?? input.cmd ?? input.script ?? input.shell;
-      //if (cmd && !input.command) console.log(`[FIX] Bash: remapped to "command"`);
       const out = { command: cmd ?? "" };
       if (input.timeout !== undefined) out.timeout = input.timeout;
       return { name, input: out };
     }
     case "Read": {
       const fp = input.file_path ?? input.path ?? input.file ?? input.filepath ?? input.filename;
-      //if (fp && !input.file_path) console.log(`[FIX] Read: remapped to "file_path"`);
       const out = { file_path: fp ?? "" };
       if (input.offset !== undefined) out.offset = input.offset;
       if (input.limit  !== undefined) out.limit  = input.limit;
@@ -226,7 +236,6 @@ function fixToolCall(rawName, rawInput) {
     case "Write": {
       const fp = input.file_path ?? input.path ?? input.file ?? input.filepath;
       const content = input.content ?? input.text ?? input.data ?? input.body;
-      //if (fp && !input.file_path) console.log(`[FIX] Write: remapped to "file_path"`);
       return { name, input: { file_path: fp ?? "", content: content ?? "" } };
     }
     case "Edit": {
@@ -256,12 +265,10 @@ function fixToolCall(rawName, rawInput) {
     }
     case "WebFetch": {
       const url = input.url ?? input.link ?? input.href ?? "";
-      //if (url && !input.url) console.log(`[FIX] WebFetch: remapped to "url"`);
       return { name, input: { url } };
     }
     case "WebSearch": {
       const query = input.query ?? input.search ?? input.q ?? "";
-      //if (query && !input.query) console.log(`[FIX] WebSearch: remapped to "query"`);
       return { name, input: { query } };
     }
     case "NotebookEdit": {
@@ -276,11 +283,11 @@ function fixToolCall(rawName, rawInput) {
 }
 
 // ── Streaming 轉換 (即時 NDJSON → Anthropic SSE) ───────────────────────────
-function streamToAnthropic(ollamaStream, res, model) {
+function streamToAnthropic(ollamaStream, res, model, connId, estimatedTokens, startTime) {
   const msgId = `msg_${Math.random().toString(36).slice(2, 18)}`;
   let localInputTokens = 0;
   let localOutputTokens = 0;
-  
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -308,8 +315,6 @@ function streamToAnthropic(ollamaStream, res, model) {
 
   let buf = "";
   let textBlockStarted = false;
-  // ★ tool call 改為 buffer，key 用 Ollama 傳來的 index（或順序）
-  // 結構：Map<number, { name: string, arguments: object }>
   const toolCallMap = new Map();
 
   ollamaStream.on("data", (chunk) => {
@@ -322,15 +327,12 @@ function streamToAnthropic(ollamaStream, res, model) {
       try {
         const p = JSON.parse(line);
         const message = p.message || {};
-        
+
         if (p.done) {
-          if (p.done) {
-            localInputTokens = p.prompt_eval_count ?? 0;
-            localOutputTokens = p.eval_count ?? 0;
-          }
+          localInputTokens  = p.prompt_eval_count ?? 0;
+          localOutputTokens = p.eval_count ?? 0;
         }
 
-        // ── 文字：照常即時串流 ──────────────────────────────
         const deltaText = message.content || "";
         if (deltaText) {
           if (!textBlockStarted) {
@@ -346,12 +348,9 @@ function streamToAnthropic(ollamaStream, res, model) {
           });
         }
 
-        // ── Tool call：只累積，不送出 ──────────────────────
         const toolCalls = message.tool_calls || [];
         for (let i = 0; i < toolCalls.length; i++) {
           const tc = toolCalls[i];
-          // 用 index i 作為 key，Ollama 每次 chunk 可能送相同 index 的更新版本
-          // 直接覆蓋（Ollama streaming 工具呼叫是累積更新，非差分）
           toolCallMap.set(i, {
             name: tc.function?.name || "",
             arguments: tc.function?.arguments || {}
@@ -364,14 +363,10 @@ function streamToAnthropic(ollamaStream, res, model) {
   });
 
   ollamaStream.on("end", () => {
-    //console.log(`[STREAM] ended, textBlock=${textBlockStarted}, toolCalls=${toolCallMap.size}`);
-
-    // 關閉文字 block
     if (textBlockStarted) {
       sse("content_block_stop", { type: "content_block_stop", index: 0 });
     }
 
-    // 送出所有完整的 tool call（stream 結束後才送，保證完整性）
     let toolIndex = textBlockStarted ? 1 : 0;
     for (const [, tc] of toolCallMap) {
       const fixed = fixToolCall(tc.name, tc.arguments);
@@ -401,19 +396,26 @@ function streamToAnthropic(ollamaStream, res, model) {
       usage: { input_tokens: localInputTokens, output_tokens: localOutputTokens }
     });
     sse("message_stop", { type: "message_stop" });
+
+    // ── END log ──
+    const elapsed = Date.now() - startTime;
+    log(connId, `◀ END    reason=${stopReason}  elapsed=${elapsed}ms`);
+    log(connId, `  tokens  estimated=${estimatedTokens}  ollama_in=${localInputTokens}  ollama_out=${localOutputTokens}  correction=${tokenCorrectionFactor.toFixed(2)}`);
+
     done();
   });
 
   ollamaStream.on("error", (e) => {
-    console.error("[STREAM] error", e);
+    console.error(`[${ts()}][${connId}] [STREAM ERROR]`, e);
     done();
   });
 }
 
-// ── 修正與完全體版本的 noThinkApiChat ──────────────────────────────────────────
-function noThinkApiChat(body, res) {
+// ── noThinkApiChat ──────────────────────────────────────────────────────────
+function noThinkApiChat(body, res, connId, estimatedTokens, startTime) {
   const model = resolveModel(body.model, false);
   const isStream = body.stream ?? false;
+  const numCtx = getNumCtx(false);
   const tools = (body.tools ?? []).filter(t => !isServerTool(t));
   let system = body.system ?? "";
   if (Array.isArray(system)) system = system.map(b => b.text ?? "").join(" ");
@@ -421,11 +423,13 @@ function noThinkApiChat(body, res) {
   const ollamaBody = {
     model,
     messages: toOllamaMessages(body.messages ?? [], system),
-    think: false, // 關閉思考鏈
+    think: false,
     stream: isStream,
-    options: { num_predict: body.max_tokens ?? 8192, num_ctx: getNumCtx(false) },
+    options: { num_predict: body.max_tokens ?? 8192, num_ctx: numCtx },
     ...(tools.length > 0 ? { tools: toOllamaTools(tools) } : {})
   };
+
+  log(connId, `→ /api/chat  ctx=${numCtx}`);
 
   const payload = JSON.stringify(ollamaBody);
   const options = {
@@ -439,14 +443,10 @@ function noThinkApiChat(body, res) {
     }
   };
 
-  //console.log(`[DEBUG] /api/chat request sent, stream=${isStream}`);
-
   const req = http.request(options, (ollamaRes) => {
     if (isStream) {
-      // 串流模式：直接將 Ollama 的 response 丟進轉譯器處理
-      streamToAnthropic(ollamaRes, res, model);
+      streamToAnthropic(ollamaRes, res, model, connId, estimatedTokens, startTime);
     } else {
-      // 非串流模式：收集完整資料後，一次性打包成 Anthropic 格式 JSON 回傳
       let buf = "";
       ollamaRes.on("data", (c) => { buf += c.toString(); });
       ollamaRes.on("end", () => {
@@ -455,29 +455,62 @@ function noThinkApiChat(body, res) {
           let fullText = "";
           let inputTokens = 0;
           let outputTokens = 0;
+          let stopReason = "end_turn";
+          const toolCallMap = new Map();
 
           for (const line of lines) {
             const p = JSON.parse(line);
             fullText += p.message?.content || "";
+
+            // tool calls（非串流也可能有）
+            const toolCalls = p.message?.tool_calls || [];
+            for (let i = 0; i < toolCalls.length; i++) {
+              const tc = toolCalls[i];
+              toolCallMap.set(i, {
+                name: tc.function?.name || "",
+                arguments: tc.function?.arguments || {}
+              });
+            }
+
             if (p.done) {
-              inputTokens = p.prompt_eval_count ?? 0;
+              inputTokens  = p.prompt_eval_count ?? 0;
               outputTokens = p.eval_count ?? 0;
             }
           }
-          
+
+          const contentBlocks = [];
+          if (fullText) contentBlocks.push({ type: "text", text: fullText });
+
+          for (const [, tc] of toolCallMap) {
+            const fixed = fixToolCall(tc.name, tc.arguments);
+            contentBlocks.push({
+              type: "tool_use",
+              id: `toolu_${Math.random().toString(36).slice(2, 14)}`,
+              name: fixed.name,
+              input: fixed.input
+            });
+          }
+
+          if (toolCallMap.size > 0) stopReason = "tool_use";
+
           const anthropicResponse = {
             id: `msg_${Math.random().toString(36).slice(2, 18)}`,
             type: "message",
             role: "assistant",
             model,
-            content: [{ type: "text", text: fullText }],
-            stop_reason: "end_turn",
+            content: contentBlocks,
+            stop_reason: stopReason,
             usage: { input_tokens: inputTokens, output_tokens: outputTokens }
           };
 
+          // ── END log ──
+          const elapsed = Date.now() - startTime;
+          log(connId, `◀ END    reason=${stopReason}  elapsed=${elapsed}ms`);
+          log(connId, `  tokens  estimated=${estimatedTokens}  ollama_in=${inputTokens}  ollama_out=${outputTokens}  correction=${tokenCorrectionFactor.toFixed(2)}`);
+
           res.json(anthropicResponse);
         } catch (err) {
-          console.error("[JSON PARSE ERROR]", err);
+          console.error(`[${ts()}][${connId}] [JSON PARSE ERROR]`, err);
           if (!res.headersSent) res.status(500).json({ error: "Failed to parse Ollama response" });
         }
       });
@@ -485,7 +518,7 @@ function noThinkApiChat(body, res) {
   });
 
   req.on("error", (err) => {
-    console.error("[ERROR]", err);
+    console.error(`[${ts()}][${connId}] [ERROR]`, err);
     if (!res.headersSent) {
       res.status(502).json({ error: { type: "proxy_error", message: err.message } });
     }
@@ -497,16 +530,19 @@ function noThinkApiChat(body, res) {
 }
 
 // ── 直接轉發 /v1/messages (think=true 或無強制模型時) ──────────────────────
-function proxyToOllama(path, body, res, isStream) {
+function proxyToOllama(path, body, res, isStream, connId, estimatedTokens) {
+  const startTime = connId ? undefined : Date.now(); // startTime 由呼叫方傳入時已記錄
   const payload = JSON.stringify(body);
   const options = {
     hostname: OLLAMA_HOST, port: OLLAMA_PORT, path, method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(payload),
-      // 不轉發 anthropic-beta / x-claude-code-*，避免 Ollama 報錯
     }
   };
+
+  const reqStart = Date.now();
+
   const req = http.request(options, (r) => {
     res.status(r.statusCode);
     for (const [k,v] of Object.entries(r.headers)) {
@@ -518,20 +554,41 @@ function proxyToOllama(path, body, res, isStream) {
       res.setHeader("X-Accel-Buffering", "no");
       const ka = setInterval(() => { if(!res.writableEnded) res.write(": keep-alive\n\n"); }, KEEPALIVE_MS);
       r.on("data", c => { if(!res.writableEnded) res.write(c); });
-      r.on("end", () => { clearInterval(ka); if(!res.writableEnded) res.end(); });
+      r.on("end", () => {
+        clearInterval(ka);
+        if(!res.writableEnded) res.end();
+        if (connId) {
+          const elapsed = Date.now() - reqStart;
+          log(connId, `◀ END    elapsed=${elapsed}ms`);
+          // think=true 的 passthrough 無法取得 Ollama token 數（格式由 Ollama /v1/messages 自行包裝）
+        }
+      });
     } else {
-      let d = ""; r.on("data", c => d += c); r.on("end", () => res.send(d));
+      let d = "";
+      r.on("data", c => d += c);
+      r.on("end", () => {
+        res.send(d);
+        if (connId) {
+          const elapsed = Date.now() - reqStart;
+          log(connId, `◀ END    elapsed=${elapsed}ms`);
+        }
+      });
     }
   });
+
   req.setTimeout(600000, () => req.destroy());
-  req.on("error", err => { if(!res.headersSent) res.status(502).json({error:{type:"proxy_error",message:err.message}}); });
-  req.write(payload); req.end();
+  req.on("error", err => {
+    if (connId) log(connId, `[ERROR]`, err.message);
+    if(!res.headersSent) res.status(502).json({error:{type:"proxy_error",message:err.message}});
+  });
+  req.write(payload);
+  req.end();
 }
 
 // ── 記錄 Claude Code 自訂標頭 ────────────────────────────────────────────
 function logClaudeHeaders(req) {
   return;
-  
+
   const beta = req.headers["anthropic-beta"];
   const sessionId = req.headers["x-claude-code-session-id"];
   const agentId = req.headers["x-claude-code-agent-id"];
@@ -545,40 +602,42 @@ function logClaudeHeaders(req) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.post("/v1/messages", (req, res) => {
-  logClaudeHeaders(req);   // 記錄自訂標頭
+  logClaudeHeaders(req);
 
   if (req.body.model) req.body.model = cleanModelName(req.body.model);
   const body = req.body;
 
-  // 對本次請求內容進行 token 估算，供後續校正使用（僅 /api/chat 路徑會用到）
   const estimatedTokens = estimateTokens(body.system) +
                           estimateTokens(body.messages) +
                           estimateTokens(body.tools);
 
-  const thinkType = body.thinking?.type ?? "none";
   const betaHeaders = req.headers["anthropic-beta"] || "";
+  const connId = newConnId();
+  const startTime = Date.now();
 
   if (!FORCE_MODEL) {
-    proxyToOllama("/v1/messages", body, res, body.stream ?? false);
+    const model = cleanModelName(body.model);
+    log(connId, `▶ START  model=${model}  think=N/A  stream=${body.stream ?? false}`);
+    log(connId, `→ passthrough /v1/messages`);
+    proxyToOllama("/v1/messages", body, res, body.stream ?? false, connId, estimatedTokens);
     return;
   }
 
   const useThink = resolveThink(body, betaHeaders);
   const model = resolveModel(body.model, useThink) || "(from request)";
-  const numCtx = getNumCtx(useThink);
 
-  //console.log(`[${new Date().toISOString()}] thinking=${thinkType} → think=${useThink} path=${useThink ? "/v1/messages" : "/api/chat"} model=${model} ctx=${numCtx}`);
+  log(connId, `▶ START  model=${model}  think=${useThink}  stream=${body.stream ?? false}`);
 
   if (useThink) {
-    passthroughThink(body, res);
+    passthroughThink(body, res, connId, estimatedTokens);
   } else {
-    noThinkApiChat(body, res, estimatedTokens);
+    noThinkApiChat(body, res, connId, estimatedTokens, startTime);
   }
 });
 
-// ── Token 計數端點（改良版，不使用過去的 prompt_eval_count） ──────────────
+// ── Token 計數端點 ──────────────────────────────────────────────────────────
 app.post("/v1/messages/count_tokens", (req, res) => {
-  logClaudeHeaders(req);   // 記錄自訂標頭
+  logClaudeHeaders(req);
 
   const body = req.body;
   const rawEstimate = estimateTokens(body.system) +
@@ -588,6 +647,8 @@ app.post("/v1/messages/count_tokens", (req, res) => {
   let tokenCount = Math.round(rawEstimate * tokenCorrectionFactor);
   const upperLimit = Math.floor(CONTEXT_WINDOW * 0.95);
   if (tokenCount > upperLimit) tokenCount = upperLimit;
+
+  log("--CTX-", `count_tokens  raw=${rawEstimate}  factor=${tokenCorrectionFactor.toFixed(2)}  corrected=${tokenCount}  cap=${upperLimit}`);
 
   res.json({ input_tokens: tokenCount, context_window: CONTEXT_WINDOW });
 });
@@ -616,7 +677,6 @@ app.all("*", (req, res) => {
       hostname: OLLAMA_HOST, port: OLLAMA_PORT, path: req.url, method: req.method,
       headers: { ...req.headers, host: `${OLLAMA_HOST}:${OLLAMA_PORT}` }
     };
-    // 移除可能造成問題的 hop-by-hop 標頭
     delete opts.headers["transfer-encoding"];
     delete opts.headers["connection"];
 
@@ -633,5 +693,16 @@ app.all("*", (req, res) => {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 app.listen(PROXY_PORT, "0.0.0.0", () => {
-  console.log(`Ollama Think Proxy started on port ${PROXY_PORT}`);
+  console.log(`[${ts()}] ╔══════════════════════════════════════════╗`);
+  console.log(`[${ts()}] ║       ollama-proxy  starting up          ║`);
+  console.log(`[${ts()}] ╚══════════════════════════════════════════╝`);
+  console.log(`[${ts()}] [ENV] OLLAMA_HOST          = ${OLLAMA_HOST}`);
+  console.log(`[${ts()}] [ENV] OLLAMA_PORT          = ${OLLAMA_PORT}`);
+  console.log(`[${ts()}] [ENV] PROXY_PORT           = ${PROXY_PORT}`);
+  console.log(`[${ts()}] [ENV] FORCE_MODEL          = ${FORCE_MODEL || "(none)"}`);
+  console.log(`[${ts()}] [ENV] FORCE_MODEL_THINK    = ${FORCE_MODEL_THINK || "(none)"}`);
+  console.log(`[${ts()}] [ENV] NUM_CTX              = ${NUM_CTX}`);
+  console.log(`[${ts()}] [ENV] NUM_CTX_THINK        = ${NUM_CTX_THINK}`);
+  console.log(`[${ts()}] [ENV] CONTEXT_WINDOW       = ${CONTEXT_WINDOW}`);
+  console.log(`[${ts()}] Ollama Think Proxy started on port ${PROXY_PORT}`);
 });
