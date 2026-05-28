@@ -24,6 +24,8 @@ services:
         fi &&
         sh /app/start_ollama_proxy.sh
       "
+    networks:
+      - ai_suite_network
 
 volumes:
   ollama-proxy-app:

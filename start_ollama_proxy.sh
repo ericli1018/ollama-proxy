@@ -16,26 +16,13 @@ fi
 PROXY_PORT="${OLLAMA_PROXY_PORT:-11435}"
 LOG_FILE="${PROXY_DIR}/ollama_proxy.log"
 
-# ── Port 檢查（alpine 沒有 lsof，依序 fallback）─────────
-port_in_use() {
-  if command -v lsof > /dev/null 2>&1; then
-    lsof -i:"$1" -sTCP:LISTEN -t > /dev/null 2>&1
-  elif command -v nc > /dev/null 2>&1; then
-    nc -z localhost "$1" > /dev/null 2>&1
-  elif command -v ss > /dev/null 2>&1; then
-    ss -tlnp | grep -q ":$1 "
-  else
-    grep -q "$(printf '%04X' "$1")" /proc/net/tcp 2>/dev/null
-  fi
-}
-
-# 已在跑 → 結束
-if port_in_use "$PROXY_PORT"; then
-  echo "ollama proxy already running on port $PROXY_PORT"
-  exit 0
+# ── Docker 內才需要裝 git ─────────────────────────────────
+if [ "$IS_DOCKER" = "true" ] && ! command -v git > /dev/null 2>&1; then
+  echo "Installing git..." >&2
+  apk add --no-cache git
 fi
 
-# ── index.js 不存在則 git clone ──────────────────────────
+# ── clone 或 pull ─────────────────────────────────────────
 if [ ! -f "$PROXY_DIR/index.js" ]; then
   echo "index.js not found, cloning repo to $PROXY_DIR ..." >&2
   if ! command -v git > /dev/null 2>&1; then
@@ -46,6 +33,9 @@ if [ ! -f "$PROXY_DIR/index.js" ]; then
     echo "Error: git clone failed" >&2
     exit 1
   }
+elif [ "$IS_DOCKER" = "true" ]; then
+  echo "Pulling latest code..." >&2
+  git -C "$PROXY_DIR" pull || echo "Warning: git pull failed, using existing code" >&2
 fi
 
 # ── node 存在檢查 ─────────────────────────────────────────
@@ -54,10 +44,35 @@ if ! command -v node > /dev/null 2>&1; then
   exit 0
 fi
 
-# ── npm install（node_modules 不存在時）──────────────────
-if [ ! -d "$PROXY_DIR/node_modules" ]; then
-  echo "Running npm install in $PROXY_DIR ..." >&2
-  (cd "$PROXY_DIR" && npm install --silent) >> "$LOG_FILE" 2>&1
+# ── npm install ───────────────────────────────────────────
+if [ "$IS_DOCKER" = "true" ]; then
+  echo "Running npm install..." >&2
+  (cd "$PROXY_DIR" && npm install --silent) 2>&1
+else
+  if [ ! -d "$PROXY_DIR/node_modules" ]; then
+    echo "Running npm install in $PROXY_DIR ..." >&2
+    (cd "$PROXY_DIR" && npm install --silent) >> "$LOG_FILE" 2>&1
+  fi
+fi
+
+# ── Port 檢查（Docker 內跳過，容器啟動必定是乾淨的）─────
+if [ "$IS_DOCKER" = "false" ]; then
+  port_in_use() {
+    if command -v lsof > /dev/null 2>&1; then
+      lsof -i:"$1" -sTCP:LISTEN -t > /dev/null 2>&1
+    elif command -v nc > /dev/null 2>&1; then
+      nc -z localhost "$1" > /dev/null 2>&1
+    elif command -v ss > /dev/null 2>&1; then
+      ss -tlnp | grep -q ":$1 "
+    else
+      grep -q "$(printf '%04X' "$1")" /proc/net/tcp 2>/dev/null
+    fi
+  }
+
+  if port_in_use "$PROXY_PORT"; then
+    echo "ollama proxy already running on port $PROXY_PORT"
+    exit 0
+  fi
 fi
 
 # ── 啟動 ─────────────────────────────────────────────────
