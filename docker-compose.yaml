@@ -6,6 +6,7 @@ services:
     ports:
       - "11435:11435"
     environment:
+      RUNNING_IN_DOCKER: "true"
       OLLAMA_PROXY_OLLAMA_HOST: ollama
       OLLAMA_PROXY_OLLAMA_PORT: "11434"
       OLLAMA_PROXY_PORT: "11435"
@@ -21,7 +22,7 @@ services:
         apk add --no-cache git &&
         if [ ! -f /app/start_ollama_proxy.sh ]; then
           git clone https://github.com/ericli1018/ollama-proxy.git /app;
-        fi &&
+        fi &&tart_ollama_proxy.s
         sh /app/start_ollama_proxy.sh
       "
     networks:

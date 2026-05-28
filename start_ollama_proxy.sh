@@ -4,7 +4,7 @@
 REPO_URL="https://github.com/ericli1018/ollama-proxy.git"
 
 # ── 判斷是否在 Docker 容器內 ──────────────────────────────
-if [ -f "/.dockerenv" ]; then
+if [ "${RUNNING_IN_DOCKER}" = "true" ]; then
   IS_DOCKER=true
   PROXY_DIR="/app"
 else
