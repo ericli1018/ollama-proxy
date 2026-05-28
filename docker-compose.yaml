@@ -1,0 +1,29 @@
+services:
+  ollama-proxy:
+    image: node:22-alpine
+    container_name: ollama-proxy
+    restart: unless-stopped
+    ports:
+      - "11435:11435"
+    environment:
+      OLLAMA_PROXY_OLLAMA_HOST: ollama
+      OLLAMA_PROXY_OLLAMA_PORT: "11434"
+      OLLAMA_PROXY_PORT: "11435"
+      OLLAMA_PROXY_OLLAMA_MODEL: qwen3.6:27b-q4_K_M
+      OLLAMA_PROXY_OLLAMA_MODEL_THINK: ""
+      OLLAMA_PROXY_NUM_CTX: "32768"
+      OLLAMA_PROXY_NUM_CTX_THINK: "32768"
+      OLLAMA_PROXY_CONTEXT_WINDOW: "32768"
+    volumes:
+      - ollama-proxy-app:/app
+    command: >
+      sh -c "
+        apk add --no-cache git &&
+        if [ ! -f /app/start_ollama_proxy.sh ]; then
+          git clone https://github.com/ericli1018/ollama-proxy.git /app;
+        fi &&
+        sh /app/start_ollama_proxy.sh
+      "
+
+volumes:
+  ollama-proxy-app:

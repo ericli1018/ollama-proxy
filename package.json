@@ -1,0 +1,13 @@
+{
+  "name": "ollama-proxy",
+  "version": "1.0.0",
+  "description": "Think-aware proxy between Claude Code and Ollama Qwen3",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
