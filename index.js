@@ -208,7 +208,7 @@ function toOllamaTools(tools = []) {
   }));
 }
 
-const KNOWN_TOOLS = new Set(["Agent","AskUserQuestion","Bash","CronCreate","CronDelete","CronList","Edit","EnterPlanMode","EnterWorktree","ExitPlanMode","ExitWorktree","ListMcpResourcesTool","LSP","NotebookEdit","Read","ReadMcpResourceTool","ScheduleWakeup","Skill","TaskCreate","TaskGet","TaskList","TaskOutput","TaskStop","TaskUpdate","WaitForMcpServers","WebFetch","WebSearch","Write"]);
+const KNOWN_TOOLS = new Set(["Agent","AskUserQuestion","Bash","CronCreate","CronDelete","CronList","Edit","EnterPlanMode","EnterWorktree","ExitPlanMode","ExitWorktree","ListMcpResourcesTool","LSP","NotebookEdit","Read","ReadMcpResourceTool","ScheduleWakeup","Skill","TaskCreate","TaskGet","TaskList","TaskOutput","TaskStop","TaskUpdate","WaitForMcpServers","WebFetch","WebSearch","TodoWrite","Write"]);
 const SHELL_RE = /^(find|ls|cat|grep|echo|cd|mkdir|rm|mv|cp|touch|chmod|curl|wget|git|npm|node|python|pip|sed|awk|sort|head|tail|wc|ps|which|stat)\b/;
 
 function fixToolCall(rawName, rawInput) {
@@ -267,9 +267,76 @@ function fixToolCall(rawName, rawInput) {
       const url = input.url ?? input.link ?? input.href ?? "";
       return { name, input: { url } };
     }
-    case "WebSearch": {
-      const query = input.query ?? input.search ?? input.q ?? "";
-      return { name, input: { query } };
+    case "WebFetch": {
+      const url = input.url ?? input.link ?? input.href ?? "";
+      const prompt = input.prompt ?? input.query ?? input.question ?? input.instruction ?? "Summarize the content";
+      return { name, input: { url, prompt } };
+    }
+    case "AskUserQuestion": {
+      const rawQuestions = input.questions ?? input.prompts ?? input.items ?? [];
+      const normalized = rawQuestions.map((q, i) => {
+        const questionText =
+          q.question ?? q.text ?? q.prompt ??
+          q.content  ?? q.message ?? q.q ?? "";
+        const header = (
+          q.header ?? q.title ?? q.label ??
+          q.tag    ?? q.name  ?? `Q${i + 1}`
+        ).slice(0, 12);
+        const multiSelect =
+          q.multiSelect    ?? q.multi_select ??
+          q.multiple       ?? q.allowMultiple ?? false;
+        const rawOptions = q.options ?? q.choices ?? q.answers ?? [];
+        const options = rawOptions.map(opt => {
+          if (typeof opt === "string") return { label: opt.slice(0, 30), description: opt };
+          return {
+            label:       (opt.label ?? opt.text ?? opt.value ?? opt.name ?? "").slice(0, 30),
+            description:  opt.description ?? opt.desc ?? opt.detail ?? opt.label ?? opt.text ?? ""
+          };
+        });
+        while (options.length < 2) options.push({ label: `Option ${options.length + 1}`, description: "" });
+        return { question: questionText, header, multiSelect, options: options.slice(0, 4) };
+      });
+      return { name, input: { questions: normalized } };
+    }
+    case "ExitPlanMode": {
+      const plan =
+        input.plan ?? input.content ?? input.text ??
+        input.description ?? input.summary ?? input.response ?? "";
+      return { name, input: { plan } };
+    }
+    case "TodoWrite": {
+      const rawTodos = input.todos ?? input.tasks ?? input.items ?? [];
+      const VALID_STATUS = new Set(["pending", "in_progress", "completed"]);
+      const STATUS_MAP = {
+        todo: "pending", not_started: "pending", open: "pending",
+        doing: "in_progress", active: "in_progress", wip: "in_progress", working: "in_progress",
+        done: "completed", complete: "completed", finished: "completed", closed: "completed"
+      };
+      const todos = rawTodos.map(t => {
+        const content =
+          t.content ?? t.task ?? t.title ??
+          t.text    ?? t.description ?? t.name ?? "";
+        const rawStatus = (t.status ?? t.state ?? "pending").toLowerCase().replace(/[-\s]/g, "_");
+        const status = VALID_STATUS.has(rawStatus) ? rawStatus : (STATUS_MAP[rawStatus] ?? "pending");
+        // activeForm 從 content 自動生成（去掉句號，加 ing）
+        const activeForm =
+          t.activeForm ?? t.active_form ?? t.active ??
+          (content.replace(/\.$/, "").replace(/^(\w+)/, (v) => v.replace(/e$/, "") + "ing") || content);
+        return { content, status, activeForm };
+      });
+      return { name, input: { todos } };
+    }
+    case "Agent": {
+      const prompt =
+        input.prompt ?? input.task ?? input.instructions ??
+        input.content ?? input.message ?? "";
+      const description =
+        input.description ?? input.title ?? input.summary ??
+        input.name ?? prompt.slice(0, 40);
+      const subagent_type =
+        input.subagent_type ?? input.agent_type ?? input.type ??
+        input.agent ?? input.mode ?? "general-purpose";
+      return { name, input: { prompt, description, subagent_type } };
     }
     case "NotebookEdit": {
       const np = input.notebook_path ?? input.path ?? input.file_path ?? "";
