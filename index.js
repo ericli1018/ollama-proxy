@@ -2,9 +2,7 @@
  * ollama-proxy — Hybrid think-control proxy for Claude Code + Ollama
  * ==================================================================
  * think=true  → /v1/messages + thinking:enabled
- * think=false → /api/chat   + think:false
- *              → server tool 偵測到時切換 /v1/messages
- *              → tool_calls 偵測到時 retry /v1/messages
+ * think=false → /api/chat   + think:false（server tool 過濾）
  *              → FORCE_MODEL_THINK 有設時直接 bypass /v1/messages
  *
  * ENV:
@@ -257,25 +255,20 @@ function fixToolCall(rawName, rawInput) {
       return { name, input: { query } };
     }
     case "AskUserQuestion": {
-      // FIX: questions 可能是字串或非陣列，一律 normalize 成陣列
+      // 只確保 questions 是陣列，內部結構完全不動
       const raw = input.questions ?? input.prompts ?? input.items ?? [];
-      const arr = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-      const questions = arr.map((q, i) => {
-        if (typeof q === "string") {
-          return { question: q, header: `Q${i+1}`, multiSelect: false, options: [{ label: "Yes", description: "" }, { label: "No", description: "" }] };
-        }
-        const questionText = q.question ?? q.text ?? q.prompt ?? q.content ?? q.message ?? "";
-        const header       = String(q.header ?? q.title ?? q.label ?? q.tag ?? q.name ?? `Q${i+1}`).slice(0, 12);
-        const multiSelect  = q.multiSelect ?? q.multi_select ?? q.multiple ?? q.allowMultiple ?? false;
-        const rawOptions   = q.options ?? q.choices ?? q.answers ?? [];
-        const options      = (Array.isArray(rawOptions) ? rawOptions : [rawOptions]).map(opt => {
-          if (typeof opt === "string") return { label: opt.slice(0, 30), description: opt };
-          return { label: String(opt.label ?? opt.text ?? opt.value ?? opt.name ?? "").slice(0, 30), description: opt.description ?? opt.desc ?? "" };
-        });
-        while (options.length < 2) options.push({ label: `Option ${options.length + 1}`, description: "" });
-        return { question: questionText, header, multiSelect, options: options.slice(0, 4) };
-      });
-      return { name, input: { questions } };
+      let questions;
+      if (Array.isArray(raw)) {
+        questions = raw;
+      } else if (typeof raw === "string") {
+        try { questions = JSON.parse(raw); } catch { questions = [{ question: raw, options: [] }]; }
+        if (!Array.isArray(questions)) questions = [questions];
+      } else if (typeof raw === "object" && raw !== null) {
+        questions = [raw];
+      } else {
+        questions = [];
+      }
+      return { name, input: { ...input, questions } };
     }
     case "ExitPlanMode": {
       const plan = input.plan ?? input.content ?? input.text ?? input.description ?? input.summary ?? input.response ?? "";
@@ -607,8 +600,6 @@ app.listen(PROXY_PORT, "0.0.0.0", () => {
   console.log(`[${ts()}] [ENV] CONTEXT_WINDOW       = ${CONTEXT_WINDOW}`);
   console.log(`[${ts()}] ─────────────────────────────────────────────`);
   console.log(`[${ts()}] think=true   → /v1/messages (bypass, Ollama 原生處理)`);
-  console.log(`[${ts()}] think=false  → /api/chat + think:false`);
-  console.log(`[${ts()}]   + server tool → /v1/messages`);
-  console.log(`[${ts()}]   + tool_calls  → retry /v1/messages`);
-  console.log(`[${ts()}]   + both models → /v1/messages bypass`);
+  console.log(`[${ts()}] think=false  → /api/chat + think:false（server tool 過濾）`);
+  console.log(`[${ts()}]   + FORCE_MODEL_THINK 有設 → /v1/messages bypass`);
 });
