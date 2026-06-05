@@ -397,30 +397,21 @@ function streamToAnthropic(ollamaStream, res, model, connId, startTime) {
   });
 }
 
-// ── noThinkApiChat ────────────────────────────────────────────────────────────
 function noThinkApiChat(body, res, connId, startTime) {
   const model    = resolveModel(body.model, false);
   const isStream = body.stream ?? false;
   const numCtx   = getNumCtx(false);
-  const tools    = body.tools ?? [];
+  const tools    = (body.tools ?? []).filter(t => !isServerTool(t));
   let system = body.system ?? "";
   if (Array.isArray(system)) system = system.map(b => b.text ?? "").join(" ");
 
-  // ① 兩個模型都設定 → think=false 也 bypass 到 /v1/messages
+  // 兩個模型都設定 → think=false 也 bypass 到 /v1/messages
   if (FORCE_MODEL_THINK) {
     log(connId, `[BYPASS] both models set → /v1/messages`);
     passthroughV1Messages(body, res, model, connId);
     return;
   }
 
-  // ② server tool 偵測 → 切換 /v1/messages（讓 Ollama middleware 執行搜尋）
-  if (tools.some(isServerTool)) {
-    log(connId, `[SERVER TOOL] detected → switching to /v1/messages`);
-    passthroughV1Messages(body, res, model, connId);
-    return;
-  }
-
-  // ③ 走 /api/chat + think:false，緩衝後偵測 tool_calls
   const ollamaBody = {
     model,
     messages: toOllamaMessages(body.messages ?? [], system),
@@ -439,30 +430,8 @@ function noThinkApiChat(body, res, connId, startTime) {
   };
 
   const req = http.request(options, (ollamaRes) => {
-    // Streaming：緩衝全部 chunks，done 時判斷有無 tool_calls
     if (isStream) {
-      const bufChunks = [];
-      let   bufStr    = "";
-
-      ollamaRes.on("data", (c) => { bufChunks.push(c); bufStr += c.toString(); });
-      ollamaRes.on("end", () => {
-        // 掃描所有 chunk（不只 done）找 tool_calls
-        const hasTools = bufStr.split("\n").some(line => {
-          try { return (JSON.parse(line).message?.tool_calls ?? []).length > 0; } catch { return false; }
-        });
-
-        if (hasTools) {
-          log(connId, `[TOOL RETRY] tool_calls detected → retrying with /v1/messages`);
-          passthroughV1Messages(body, res, model, connId);
-        } else {
-          // 把緩衝的 Ollama NDJSON stream 轉成 Anthropic SSE
-          const { Readable } = require("stream");
-          const fakeStream   = Readable.from(bufChunks);
-          streamToAnthropic(fakeStream, res, model, connId, startTime);
-        }
-      });
-
-    // Non-streaming：收完再判斷
+      streamToAnthropic(ollamaRes, res, model, connId, startTime);
     } else {
       let bufStr = "";
       ollamaRes.on("data", (c) => { bufStr += c.toString(); });
@@ -482,21 +451,21 @@ function noThinkApiChat(body, res, connId, startTime) {
             if (p.done) { inputTokens = p.prompt_eval_count ?? 0; outputTokens = p.eval_count ?? 0; lastPromptEvalCount = inputTokens; }
           }
 
-          if (toolCallMap.size > 0) {
-            log(connId, `[TOOL RETRY] tool_calls detected → retrying with /v1/messages`);
-            passthroughV1Messages(body, res, model, connId);
-            return;
-          }
-
           const blocks = [];
           if (fullText) blocks.push({ type: "text", text: fullText });
+          for (const [, tc] of toolCallMap) {
+            const fixed = fixToolCall(tc.name, tc.arguments);
+            blocks.push({ type: "tool_use", id: tc.id || `toolu_${Math.random().toString(36).slice(2, 14)}`, name: fixed.name, input: fixed.input });
+          }
+
+          const stopReason = toolCallMap.size > 0 ? "tool_use" : "end_turn";
           res.json({
             id: `msg_${Math.random().toString(36).slice(2, 18)}`, type: "message", role: "assistant", model,
-            content: blocks, stop_reason: "end_turn", stop_sequence: null,
+            content: blocks, stop_reason: stopReason, stop_sequence: null,
             usage: { input_tokens: inputTokens, output_tokens: outputTokens },
           });
           const elapsed = Date.now() - startTime;
-          log(connId, `◀ END  reason=end_turn  elapsed=${elapsed}ms  in=${inputTokens}  out=${outputTokens}`);
+          log(connId, `◀ END  reason=${stopReason}  elapsed=${elapsed}ms  in=${inputTokens}  out=${outputTokens}`);
         } catch (err) {
           log(connId, `[JSON PARSE ERROR]`, err.message);
           if (!res.headersSent) res.status(500).json({ error: "Failed to parse Ollama response" });
