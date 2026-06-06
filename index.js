@@ -324,6 +324,15 @@ function streamToAnthropic(ollamaStream, res, model, connId, startTime) {
   const ka   = setInterval(() => { if (!res.writableEnded) res.write(": keep-alive\n\n"); }, KEEPALIVE_MS);
   const done = () => { clearInterval(ka); if (!res.writableEnded) res.end(); };
 
+  // Client 斷線 → 中止 Ollama stream
+  res.on("close", () => {
+    if (!ollamaStream.destroyed) {
+      log(connId, `[CLIENT DISCONNECT] aborting Ollama stream`);
+      ollamaStream.destroy();
+    }
+    clearInterval(ka);
+  });
+
   let buf = "", textBlockStarted = false;
   const toolCallMap = new Map();
 
@@ -467,11 +476,24 @@ function noThinkApiChat(body, res, connId, startTime) {
     }
   });
 
-  req.setTimeout(300_000, () => req.destroy());
+  req.setTimeout(300_000, () => {
+    log(connId, `[TIMEOUT] /api/chat timed out`);
+    req.destroy();
+    if (!res.headersSent) res.status(504).json({ error: { type: "timeout", message: "Ollama request timed out" } });
+  });
   req.on("error", (err) => {
-    log(connId, `[ERROR]`, err.message);
+    log(connId, `[OLLAMA ERROR] ${err.message}`);
     if (!res.headersSent) res.status(502).json({ error: { type: "proxy_error", message: err.message } });
   });
+
+  // Client 斷線 → 中止 Ollama 請求
+  res.on("close", () => {
+    if (!req.destroyed) {
+      log(connId, `[CLIENT DISCONNECT] aborting /api/chat request`);
+      req.destroy();
+    }
+  });
+
   req.write(payload);
   req.end();
 }
@@ -491,24 +513,62 @@ function proxyToOllama(path, body, res, isStream, connId) {
       if (!["transfer-encoding","connection"].includes(k.toLowerCase())) res.setHeader(k, v);
     }
     if (isStream) {
-      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Content-Type",  "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("X-Accel-Buffering", "no");
       const ka = setInterval(() => { if (!res.writableEnded) res.write(": keep-alive\n\n"); }, KEEPALIVE_MS);
+
+      // Ollama 斷線 → 通知 client
+      r.on("error", (err) => {
+        log(connId, `[OLLAMA DISCONNECT] ${err.message}`);
+        clearInterval(ka);
+        if (!res.writableEnded) res.end();
+      });
+
       r.on("data", c => { if (!res.writableEnded) res.write(c); });
-      r.on("end",  () => { clearInterval(ka); if (!res.writableEnded) res.end(); log(connId, `◀ END  elapsed=${Date.now()-startTime}ms`); });
+      r.on("end",  () => {
+        clearInterval(ka);
+        if (!res.writableEnded) res.end();
+        log(connId, `◀ END  elapsed=${Date.now()-startTime}ms`);
+      });
+
+      // Client 斷線 → 中止 Ollama 請求
+      res.on("close", () => {
+        if (!r.destroyed) {
+          log(connId, `[CLIENT DISCONNECT] aborting Ollama request`);
+          r.destroy();
+          clearInterval(ka);
+        }
+      });
+
     } else {
       let d = "";
+      r.on("error", (err) => {
+        log(connId, `[OLLAMA DISCONNECT] ${err.message}`);
+        if (!res.headersSent) res.status(502).json({ error: { type: "proxy_error", message: err.message } });
+      });
       r.on("data", c => d += c);
       r.on("end",  () => { res.send(d); log(connId, `◀ END  elapsed=${Date.now()-startTime}ms`); });
     }
   });
 
-  req.setTimeout(600_000, () => req.destroy());
+  req.setTimeout(600_000, () => {
+    log(connId, `[TIMEOUT] Ollama request timed out`);
+    req.destroy();
+  });
   req.on("error", err => {
-    log(connId, `[ERROR]`, err.message);
+    log(connId, `[OLLAMA ERROR] ${err.message}`);
     if (!res.headersSent) res.status(502).json({ error: { type: "proxy_error", message: err.message } });
   });
+
+  // Client 斷線 → 中止尚未建立的 Ollama 請求
+  res.on("close", () => {
+    if (!req.destroyed) {
+      log(connId, `[CLIENT DISCONNECT] aborting pending Ollama request`);
+      req.destroy();
+    }
+  });
+
   req.write(payload);
   req.end();
 }
