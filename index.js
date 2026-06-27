@@ -13,6 +13,7 @@
 const express = require("express");
 const http    = require("http");
 
+const DEBUG             = process.env.OLLAMA_PROXY_DEBUG  || false;
 const OLLAMA_HOST       = process.env.OLLAMA_PROXY_OLLAMA_HOST  || "localhost";
 const OLLAMA_PORT       = parseInt(process.env.OLLAMA_PROXY_OLLAMA_PORT   || "11434");
 const PROXY_PORT        = parseInt(process.env.OLLAMA_PROXY_PORT          || "11435");
@@ -579,7 +580,9 @@ app.post("/v1/messages", (req, res) => {
   const body      = req.body;
   const connId    = newConnId();
   const startTime = Date.now();
-
+  
+  if (DEBUG) log(connId, `▶ req.body=${JSON.stringify(body)}`);
+  
   // FORCE_MODEL 沒設 → 完全 bypass
   if (!FORCE_MODEL) {
     log(connId, `▶ bypass  model=${cleanModelName(body.model)}  stream=${body.stream ?? false}`);
